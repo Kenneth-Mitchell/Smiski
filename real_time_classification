@@ -1,0 +1,195 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+import os
+
+# YOLO-related functions
+def preprocess(image):
+    image_resized = cv2.resize(image, (640, 640))
+    image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB) / 255.0
+    image_tensor = np.transpose(image_rgb, (2, 0, 1)).astype(np.float32)
+    return np.expand_dims(image_tensor, axis=0)
+
+def postprocess(output, conf_threshold=0.5):
+    detections = output[0].squeeze(0)
+    if detections.size == 0:
+        return np.array([]), np.array([]), np.array([])
+    boxes = detections[:, :4]
+    objectness = detections[:, 4]
+    class_scores = detections[:, 5:]
+    scores = objectness * np.max(class_scores, axis=1)
+    classes = np.argmax(class_scores, axis=1)
+    indices = np.where(scores > conf_threshold)[0]
+    return boxes[indices], scores[indices], classes[indices]
+
+def scale_boxes(boxes, frame_shape, input_size):
+    h, w = frame_shape[:2]
+    input_h, input_w = input_size
+    boxes[:, 0] = boxes[:, 0] * w / input_w
+    boxes[:, 2] = boxes[:, 2] * w / input_w
+    boxes[:, 1] = boxes[:, 1] * h / input_h
+    boxes[:, 3] = boxes[:, 3] * h / input_h
+    boxes[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+    boxes[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+    boxes[:, 2] = boxes[:, 0] + boxes[:, 2]
+    boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, w)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h)
+    return boxes
+
+def find_iphone_camera():
+    index = 0
+    while True:
+        cap = cv2.VideoCapture(index)
+        if not cap.read()[0]:
+            break
+        camera_name = cap.getBackendName()
+        if "iPhone" in camera_name:
+            cap.release()
+            return index
+        cap.release()
+        index += 1
+    return None
+
+# Siamese Network for classification
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, 10),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 7),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, 4),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 4),
+            nn.ReLU(inplace=True),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 6 * 6, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 1024)
+        )
+
+    def forward_once(self, x):
+        x = self.conv(x)
+        x = x.view(x.size()[0], -1)
+        x = self.fc(x)
+        return x
+
+    def forward(self, input1, input2):
+        output1 = self.forward_once(input1)
+        output2 = self.forward_once(input2)
+        return output1, output2
+
+def preprocess_for_siamese(image):
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((100, 100)),
+        transforms.ToTensor(),
+    ])
+    return transform(image).unsqueeze(0)
+
+def load_reference_images(folder_path):
+    reference_images = {}
+    for class_folder in os.listdir(folder_path):
+        class_path = os.path.join(folder_path, class_folder)
+        if os.path.isdir(class_path):
+            for image_file in os.listdir(class_path):
+                if image_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    image_path = os.path.join(class_path, image_file)
+                    image = cv2.imread(image_path)
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    processed_image = preprocess_for_siamese(image_rgb)
+                    reference_images[class_folder] = processed_image
+                    break  # Only take the first image from each class folder
+    return reference_images
+
+def classify_smiski(siamese_net, cropped_image, reference_images):
+    processed_crop = preprocess_for_siamese(cropped_image)
+    
+    min_distance = float('inf')
+    predicted_class = None
+    
+    for class_id, ref_image in reference_images.items():
+        with torch.no_grad():
+            output1, output2 = siamese_net(processed_crop, ref_image)
+            distance = F.pairwise_distance(output1, output2).item()
+        
+        if distance < min_distance:
+            min_distance = distance
+            predicted_class = class_id
+    
+    return predicted_class, min_distance
+
+# Main script
+def main():
+    # Load YOLO model
+    onnx_model_path = 'yolov5/runs/train/exp2/weights/best.onnx'
+    session = ort.InferenceSession(onnx_model_path)
+    input_size = (640, 640)
+
+    # Initialize and load Siamese Network
+    siamese_net = SiameseNetwork().eval()
+    siamese_net.load_state_dict(torch.load('path_to_siamese_weights.pth'))
+
+    # Load reference images
+    reference_images = load_reference_images('smiski_images')
+
+    # Set up camera
+    iphone_index = find_iphone_camera()
+    if iphone_index is not None:
+        cap = cv2.VideoCapture(iphone_index)
+    else:
+        print("iPhone camera not found. Using default camera.")
+        cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Camera not accessible.")
+        return
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Unable to capture video.")
+            break
+
+        # YOLO detection
+        input_tensor = preprocess(frame)
+        outputs = session.run(None, {'images': input_tensor})
+        boxes, scores, classes = postprocess(outputs)
+        boxes = scale_boxes(boxes, frame.shape, input_size)
+
+        # Draw bounding boxes and classify Smiskis
+        for box, score, cls in zip(boxes, scores, classes):
+            x1, y1, x2, y2 = box.astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+            if x1 < x2 and y1 < y2:
+                cropped_smiski = frame[y1:y2, x1:x2]
+                predicted_class, similarity = classify_smiski(siamese_net, cropped_smiski, reference_images)
+                
+                print(f'Detected Class: {int(cls)}, Predicted Class: {predicted_class}, Conf: {score:.2f}, Similarity: {similarity:.2f}')
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f'Class: {predicted_class} Sim: {similarity:.2f}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Display the frame
+        cv2.imshow('Smiski Detection and Classification', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Release resources
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

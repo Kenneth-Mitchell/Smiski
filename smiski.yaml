@@ -1,0 +1,6 @@
+train: ../yolo_data/train # path to training images
+val: ../yolo_data/val  # path to validation images
+
+# Classes
+nc: 1  # number of classes
+names: ['smiski']  # class names
